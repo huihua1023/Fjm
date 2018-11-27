@@ -1,0 +1,315 @@
+#include "gurobi_c++.h"
+#include <sstream>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cstdlib>
+using namespace std;
+struct Operation {
+	int job;
+	int op_id;
+	int ppid;
+	vector<int> ava_machine;
+	vector<double> process_time;
+};
+struct Job {
+	vector<Operation> operation_list;
+};
+class Env {
+public:
+	//initial
+	static string fileName;
+	//problem size
+	static int job_N;
+	static int machine_M;
+	static int PPID_num;
+	static const int operation_num = 1;
+	static const int ppid_cost = 1;
+	static const int bigM = 1000;
+	static vector<Job> all_job;
+	static vector<vector<Operation>> machine_may_do;
+	//var
+	static vector<vector<vector<GRBVar>>> x_j_o_avm;
+	static vector<vector<vector<vector<GRBVar>>>> j_o_before_k_l;
+	static vector<vector<GRBVar>> t_j_o;
+	static vector<GRBVar> machine_end;
+	static GRBVar makespan;
+	
+	//function
+	static void read();
+	static void initial(GRBModel& model);
+	static void addXY(GRBModel& model);
+	static void print(GRBModel& model);
+};
+
+//Var Definition
+string Env::fileName;
+
+//parameter
+//problem size
+int Env::job_N;
+int Env::machine_M;
+int Env::PPID_num;
+
+vector<Job> Env::all_job;
+vector<vector<Operation>> Env::machine_may_do;
+//var
+vector<vector<vector<GRBVar>>> Env::x_j_o_avm;
+vector<vector<vector<vector<GRBVar>>>> Env::j_o_before_k_l;
+vector<vector<GRBVar>> Env::t_j_o;
+vector<GRBVar> Env::machine_end;
+GRBVar Env::makespan;
+
+int main(int argc, char *argv[])
+{
+	GRBEnv* env = 0;
+	try
+	{
+		
+		Env::fileName = "turedata.txt";
+		Env::read();
+		//Model var
+		env = new GRBEnv();
+		GRBModel model = GRBModel(*env);
+		Env::initial(model);
+		//Model var end
+		model.set(GRB_IntAttr_ModelSense, GRB_MINIMIZE);
+		model.update();
+		//Model const
+		Env::addXY(model);
+		model.set(GRB_DoubleParam_TimeLimit, 180);
+		//model.set(GRB_DoubleParam_MIPGap, 0.361);
+		//model.set(GRB_IntParam_FlowCoverCuts, 2);
+		//model.set(GRB_IntParam_MIRCuts, 2);
+		//model.set(GRB_IntParam_MIPFocus, 2);
+		model.update();
+		model.optimize();
+		model.write("sol.sol");
+	}
+	catch (GRBException e)
+	{
+		cout << "Error code = " << e.getErrorCode() << endl;
+		cout << e.getMessage() << endl;
+	}
+	catch (...)
+	{
+		cout << "Exception during optimization" << endl;
+	}
+
+
+	//for (int i = 0; i < courseCt ; ++i) {
+		//delete[] assign[i];
+	//}
+	//delete[] assign;
+	delete env;
+	system("pause");
+	return 0;
+}
+
+void Env::read(){
+	fstream job_p_file;
+	job_p_file.open(fileName);
+	cout << "InputFileOpen: " << job_p_file.is_open();
+	//parameter setting
+	job_p_file >> job_N >> machine_M >> PPID_num;
+	cout << " #j: " << job_N << " #m: " << machine_M << "#ppid: " << PPID_num;
+
+	all_job.resize(job_N);
+	machine_may_do.resize(machine_M);
+	//reading operation's information //may change 
+	double temp_pro;
+	for (int j = 0; j<job_N; j++) {
+		for (int op = 0; op<operation_num; op++) {
+			Operation newOne;
+			newOne.op_id = op;
+			job_p_file >> newOne.job >> newOne.ppid;
+			for (int m = 0; m<machine_M; m++) {
+				job_p_file >> temp_pro;
+				if (temp_pro != 0.0) {
+					newOne.process_time.push_back(temp_pro);
+					newOne.ava_machine.push_back(m);
+					machine_may_do[m].push_back(newOne);
+				}
+			}
+			all_job[j].operation_list.push_back(newOne);
+		}
+	}
+	job_p_file.close();
+}
+
+void Env::initial(GRBModel& model){
+	
+	model.set(GRB_StringAttr_ModelName, "CrossDock");
+
+	//x_j_o_avm are bool variables. whether job j's operation o is assigned to avm-th machine(!=machine_index)
+	x_j_o_avm.resize(job_N);
+	for (int j = 0; j< job_N; j++) {
+		x_j_o_avm[j].resize(all_job[j].operation_list.size());
+		for (int op = 0; op<all_job[j].operation_list.size(); op++) {
+			x_j_o_avm[j][op].resize(all_job[j].operation_list[op].ava_machine.size());
+			for (int avm = 0; avm< all_job[j].operation_list[op].ava_machine.size(); avm++) {
+				ostringstream temp_x;
+				temp_x << "x_" << j << "_" << op << "_" << all_job[j].operation_list[op].ava_machine[avm];//avm_index!=m_index
+				x_j_o_avm[j][op][avm] = model.addVar(0.0, 1.0, 0.0, GRB_BINARY, temp_x.str());
+			}
+		}
+	}
+
+	int job_a, oper_a, machine_a;
+	int job_b, oper_b, machine_b;
+	//j_o_before_k_l are bool variables. whether job j's operation o is processed before job k's operation l
+	//may use LookupVariableOrNull function to simplfy
+	j_o_before_k_l.resize(job_N);
+	for (int j = 0; j< job_N; j++) {
+		j_o_before_k_l[j].resize(all_job[j].operation_list.size());
+		for (int op = 0; op<all_job[j].operation_list.size(); op++) {
+			j_o_before_k_l[j][op].resize(job_N);
+			for (int k = 0; k <job_N; k++) {
+				j_o_before_k_l[j][op][k].resize(all_job[k].operation_list.size());
+			}
+		}
+	}
+	for (int m = 0; m<machine_M; m++) {
+		for (int a = 0; a< machine_may_do[m].size(); a++) {
+			for (int b = a + 1; b< machine_may_do[m].size(); b++) {
+				job_a = machine_may_do[m][a].job;
+				oper_a = machine_may_do[m][a].op_id;
+				machine_a = machine_may_do[m][a].ava_machine.size() - 1;
+				job_b = machine_may_do[m][b].job;
+				oper_b = machine_may_do[m][b].op_id;
+				machine_b = machine_may_do[m][b].ava_machine.size() - 1;
+
+				ostringstream temp_before;
+				temp_before << job_a << "_" << oper_a << "_before_" << job_b << "_" << oper_b;
+				
+				j_o_before_k_l[job_a][oper_a][job_b][oper_b] = model.addVar(0.0, 1.0, 0.0, GRB_BINARY, temp_before.str());
+				
+			}
+		}
+	}
+	//t_j_o are continue variables.
+	t_j_o.resize(job_N);
+	for (int j = 0; j< job_N; j++) {
+		t_j_o[j].resize(all_job[j].operation_list.size());
+		for (int op = 0; op<all_job[j].operation_list.size(); op++) {
+			ostringstream temp_t;
+			temp_t << "t_" << j << "_" << op;
+			t_j_o[j][op] = model.addVar(0.0, GRB_INFINITY, 0.0, GRB_CONTINUOUS, temp_t.str());
+		}
+	}
+	//makespan is continuous variable.
+	makespan = model.addVar(0.0, GRB_INFINITY, 1.0, GRB_CONTINUOUS, "makespan");
+	//machine
+	machine_end.resize( machine_M );
+	for (int m = 0; m < machine_M; m++) {
+		ostringstream temp_t;
+		temp_t << "machine_end" << m ;
+		machine_end[m] = model.addVar(0.0, GRB_INFINITY, 0.001, GRB_CONTINUOUS, temp_t.str());
+	}
+}
+
+void Env::addXY(GRBModel & model){
+	//every operation only in one machine
+	for (int j = 0; j< job_N; j++) {
+		for (int op = 0; op< all_job[j].operation_list.size(); op++) {
+			GRBLinExpr ptot = 0;
+			for (int avm = 0; avm< all_job[j].operation_list[op].ava_machine.size(); avm++) {
+				ptot += x_j_o_avm[j][op][avm];
+			}
+			ostringstream cname;
+			cname << j << "_" << op << "_to_m";
+			model.addConstr(ptot == 1, cname.str());
+		}
+	}
+	//one job seq
+	for (int j = 0; j< job_N; j++) {
+		for (int op = 1; op< all_job[j].operation_list.size(); op++) {
+			GRBLinExpr ptot = 0;
+			ptot += t_j_o[j][op];
+			ptot -= t_j_o[j][op - 1];
+			for (int avm = 0; avm<all_job[j].operation_list[op - 1].ava_machine.size(); avm++) {
+				ptot -= all_job[j].operation_list[op - 1].process_time[avm] * x_j_o_avm[j][op - 1][avm];
+			}
+			ostringstream cname;
+			cname << j << "_" << op << "time_seq";
+			model.addConstr(ptot >= 0, cname.str());
+		}
+	}
+	int job_a, oper_a, machine_a;
+	int job_b, oper_b, machine_b;
+	//jo after kl working
+	//jo before kl working 
+	for (int m = 0; m< machine_M; m++) {
+		for (int a = 0; a< machine_may_do[m].size(); a++) {
+			for (int b = a + 1; b< machine_may_do[m].size(); b++) {
+				job_a = machine_may_do[m][a].job;
+				oper_a = machine_may_do[m][a].op_id;
+				machine_a = machine_may_do[m][a].ava_machine.size() - 1;
+				job_b = machine_may_do[m][b].job;
+				oper_b = machine_may_do[m][b].op_id;
+				machine_b = machine_may_do[m][b].ava_machine.size() - 1;
+				GRBLinExpr after = 0;
+				after += t_j_o[job_a][oper_a];
+				after -= t_j_o[job_b][oper_b];
+				after -= x_j_o_avm[job_a][oper_a][machine_a]*bigM;
+				after -= x_j_o_avm[job_b][oper_b][machine_b]*bigM;
+				after += j_o_before_k_l[job_a][oper_a][job_b][oper_b]*bigM;
+				ostringstream cname;
+				cname << m << "_" << a << "_" << b << "after" ;
+				model.addConstr(after >= (all_job[job_a].operation_list[oper_a].ppid !=
+					all_job[job_b].operation_list[oper_b].ppid)*ppid_cost
+					+ all_job[job_b].operation_list[oper_b].process_time[machine_b]
+					- 2 * bigM, cname.str());
+				
+				GRBLinExpr before = 0;
+				before -= t_j_o[job_a][oper_a];
+				before += t_j_o[job_b][oper_b];
+				before -= x_j_o_avm[job_a][oper_a][machine_a]*bigM;
+				before -= x_j_o_avm[job_b][oper_b][machine_b]*bigM;
+				before -= j_o_before_k_l[job_a][oper_a][job_b][oper_b]*bigM;
+				ostringstream bname;
+				bname << m << "_" << a << "_" << b << "before";
+				model.addConstr(before >= (all_job[job_a].operation_list[oper_a].ppid !=
+					all_job[job_b].operation_list[oper_b].ppid)*ppid_cost
+					+ all_job[job_a].operation_list[oper_a].process_time[machine_a]
+					- 3 * bigM, bname.str());
+			}
+		}
+	}
+	//calculate makespan
+	for (int j = 0; j<job_N; j++) {
+		GRBLinExpr c_max = 0;
+		c_max -= makespan;
+		c_max += t_j_o[j][all_job[j].operation_list.size() - 1];
+		for (int avm = 0; avm< all_job[j].operation_list[all_job[j].operation_list.size() - 1].ava_machine.size(); avm++) {
+			GRBLinExpr machine_end_c = 0;
+			ostringstream aname;
+			aname << j<<avm << "_end";
+			c_max += x_j_o_avm[j][all_job[j].operation_list.size() - 1][avm]* all_job[j].operation_list[all_job[j].operation_list.size() - 1].process_time[avm];
+			machine_end_c += machine_end[all_job[j].operation_list[all_job[j].operation_list.size() - 1].ava_machine[avm]];
+			machine_end_c -= x_j_o_avm[j][0][avm]*bigM;
+			machine_end_c -= t_j_o[j][0];
+			model.addConstr(machine_end_c >= all_job[j].operation_list[0].process_time[avm] - bigM, aname.str());
+		}
+		ostringstream aname;
+		aname << j << "_end";
+		model.addConstr(c_max <= 0, aname.str());
+	}
+}
+
+void Env::print(GRBModel & model){
+	for (int j = 0; j < job_N; j++) {
+		for (int op = 0; op < all_job[j].operation_list.size(); op++) {
+			for (int m = 0; m < all_job[j].operation_list[op].ava_machine.size(); m++) {
+				if (x_j_o_avm[j][op][m].get(GRB_DoubleAttr_X) > 0.01) {
+					cout << j << " " <<
+						all_job[j].operation_list[op].ava_machine[m] << " " <<
+						all_job[j].operation_list[op].ppid << " " <<
+						t_j_o[j][op].get(GRB_DoubleAttr_X) << " " <<
+						all_job[j].operation_list[op].process_time[m] << endl;
+				}
+			}
+		}
+	}
+}
