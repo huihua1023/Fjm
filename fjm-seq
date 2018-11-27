@@ -1,0 +1,256 @@
+//2018.11.21 remove redundant #variable for before or not variables
+//easy version 20181113
+#include "ortools/base/commandlineflags.h"
+#include "ortools/base/logging.h"
+#include "ortools/linear_solver/linear_solver.h"
+#include <cstring>
+#include <vector>
+#include <iostream>
+#include <fstream>
+using namespace std;
+
+struct Operation{
+  int job;
+  int op_id;
+  int ppid;
+  vector<int> ava_machine;
+  vector<double> process_time;
+};
+struct Job{
+  vector<Operation> operation_list;
+};
+
+namespace operations_research {
+void RunIntegerProgrammingExample(MPSolver::OptimizationProblemType optimization_problem_type) {
+  //inputData future:needing processing sequence of job's operation 
+  fstream job_p_file;
+  job_p_file.open("examples/cpp/truedata.txt");
+//fstream job_se_file;
+//job_se_file.open("examples/cpp/job_seq.txt");
+  LOG(INFO)<<"InputFileOpen: "<< job_p_file.is_open();
+//LOG(INFO)<<job_se_file.is_open();
+  
+  //parameter setting
+  int job_N, machine_M, PPID_num;
+  job_p_file >> job_N >> machine_M >> PPID_num;
+  LOG(INFO) << " #j: " << job_N << " #m: " << machine_M << "#ppid: " << PPID_num;
+  const int operation_num = 1; //needing revised for more flexible
+  const double ppid_cost = 1; //future data may be different between different ppid 
+
+  vector<Job> all_job;
+  vector<vector<Operation>> machine_may_do;
+  all_job.resize(job_N);
+  machine_may_do.resize(machine_M);
+  //reading operation's information //may change 
+  double temp_pro;
+  for(int j=0; j<job_N; j++){
+    for(int op=0; op<operation_num; op++){
+      Operation newOne;
+      newOne.op_id = op;
+      job_p_file >> newOne.job >> newOne.ppid;
+      for(int m=0; m<machine_M; m++){
+        job_p_file >> temp_pro;
+        if(temp_pro!=0.0){
+          newOne.process_time.push_back(temp_pro);
+          newOne.ava_machine.push_back(m);
+          machine_may_do[m].push_back(newOne);
+        }
+      }
+      all_job[j].operation_list.push_back(newOne);
+    }
+  }
+  //create model
+  MPSolver solver("MIP_job_shop", optimization_problem_type);
+  const double infinity = solver.infinity();
+  const double bigM = 1000000.0;
+  solver.EnableOutput();
+  solver.set_time_limit(400000);
+  //x_j_o_avm are bool variables. whether job j's operation o is assigned to avm-th machine(!=machine_index)
+  vector<vector<vector<MPVariable*>>> x_j_o_avm;
+  x_j_o_avm.resize( job_N );
+  for(int j=0; j< job_N; j++){
+    x_j_o_avm[j].resize( all_job[j].operation_list.size() );
+    for(int op=0; op<all_job[j].operation_list.size(); op++){
+      for(int avm=0; avm< all_job[j].operation_list[op].ava_machine.size(); avm++){
+        ostringstream temp_x;
+        temp_x<<"x_"<< j<< "_"<< op<< "_"<< all_job[j].operation_list[op].ava_machine[avm];//avm_index!=m_index
+        MPVariable* const new_x = solver.MakeBoolVar(temp_x.str());
+        x_j_o_avm[j][op].push_back(new_x);
+      }
+    }
+  }
+  
+  int job_a, oper_a, machine_a;
+  int job_b, oper_b, machine_b;
+  //j_o_before_k_l are bool variables. whether job j's operation o is processed before job k's operation l
+  //may use LookupVariableOrNull function to simplfy
+  vector<vector<vector<vector<MPVariable*>>>> j_o_before_k_l;
+  j_o_before_k_l.resize( job_N );
+  for(int j=0; j< job_N; j++){
+    j_o_before_k_l[j].resize(all_job[j].operation_list.size());
+    for(int op=0; op<all_job[j].operation_list.size(); op++){
+      j_o_before_k_l[j][op].resize( job_N );
+      for(int k=0; k <job_N; k++){
+        j_o_before_k_l[j][op][k].resize(all_job[k].operation_list.size());
+      }
+    }
+  }
+  for(int m=0; m<machine_M; m++){
+    for(int a=0; a< machine_may_do[m].size(); a++){
+      for(int b=a+1; b< machine_may_do[m].size(); b++){
+        job_a = machine_may_do[m][a].job;
+        oper_a = machine_may_do[m][a].op_id;
+        machine_a = machine_may_do[m][a].ava_machine.size()-1;
+        job_b = machine_may_do[m][b].job;
+        oper_b = machine_may_do[m][b].op_id;
+        machine_b = machine_may_do[m][b].ava_machine.size()-1;
+
+        ostringstream temp_before;
+        temp_before<< job_a<< "_"<< oper_a<< "_before_"<< job_b<< "_"<< oper_b;
+        if( !solver.LookupVariableOrNull( temp_before.str() ) ){
+          MPVariable* const new_before = solver.MakeBoolVar( temp_before.str() );
+          j_o_before_k_l[job_a][oper_a][job_b][oper_b] = new_before;
+        }
+      }
+    }
+  }
+  //t_j_o are continue variables.
+  vector<vector<MPVariable*>> t_j_o;
+  t_j_o.resize(job_N);
+  for(int j=0; j< job_N; j++){
+    for(int op=0; op<all_job[j].operation_list.size(); op++){
+      ostringstream temp_t;
+      temp_t<< "t_"<< j<< "_"<< op;
+      MPVariable* const new_t = solver.MakeNumVar(0.0, infinity,temp_t.str());
+      t_j_o[j].push_back(new_t);
+    }
+  }
+  //makespan is continuous variable.
+  MPVariable* const makespan = solver.MakeNumVar(0.0, infinity, "makespan");
+  //Minimize makespan
+  MPObjective* const objective = solver.MutableObjective();
+  objective->SetMinimization();
+  objective->SetCoefficient(makespan, 1);
+  //target-idea: one operation's End_time connects with next-processing operation
+  //result: all machine's idle time minimize but the same ppid may not process successly.
+  for(int j=0; j<job_N; j++){
+    objective->SetCoefficient(t_j_o[j][all_job[j].operation_list.size()-1], 0.0000001);
+  }
+  //every operation only in one machine
+  for(int j=0; j< job_N; j++){
+    for(int op=0; op< all_job[j].operation_list.size(); op++){
+      MPConstraint* const j_o_to_m = solver.MakeRowConstraint( 1.0, 1.0);// == 1
+      for(int avm=0; avm< all_job[j].operation_list[op].ava_machine.size(); avm++){
+        j_o_to_m->SetCoefficient(x_j_o_avm[j][op][avm], 1.0);
+      }
+    }
+  }
+  //one job seq
+  for(int j=0; j< job_N; j++){
+    for(int op=1; op< all_job[j].operation_list.size(); op++){
+      MPConstraint* const jo_seq = solver.MakeRowConstraint( 0.0, infinity);// >= 0
+      jo_seq->SetCoefficient( t_j_o[j][op], 1.0);
+      jo_seq->SetCoefficient( t_j_o[j][op-1], -1.0);
+      for(int avm=0; avm<all_job[j].operation_list[op-1].ava_machine.size(); avm++){
+        jo_seq->SetCoefficient( x_j_o_avm[j][op-1][avm] , -1.0*all_job[j].operation_list[op-1].process_time[avm]);
+      }
+    }
+  }
+  //jo after kl working
+  //jo before kl working 
+for(int m=0; m< machine_M; m++){
+  for(int a=0; a< machine_may_do[m].size(); a++){
+    for(int b=a+1; b< machine_may_do[m].size(); b++){
+      job_a = machine_may_do[m][a].job;
+      oper_a = machine_may_do[m][a].op_id;
+      machine_a = machine_may_do[m][a].ava_machine.size()-1;
+      job_b = machine_may_do[m][b].job;
+      oper_b = machine_may_do[m][b].op_id;
+      machine_b = machine_may_do[m][b].ava_machine.size()-1;
+      MPConstraint* const after = solver.MakeRowConstraint((all_job[job_a].operation_list[oper_a].ppid!=
+                                                            all_job[job_b].operation_list[oper_b].ppid)*ppid_cost
+                                                            + all_job[job_b].operation_list[oper_b].process_time[machine_b]
+                                                            - 2*bigM, infinity);
+      after->SetCoefficient( t_j_o[job_a][oper_a], 1.0);
+      after->SetCoefficient( t_j_o[job_b][oper_b], -1.0);
+      after->SetCoefficient( x_j_o_avm[job_a][oper_a][machine_a], -1.0*bigM);
+      after->SetCoefficient( x_j_o_avm[job_b][oper_b][machine_b], -1.0*bigM);
+      after->SetCoefficient( j_o_before_k_l[job_a][oper_a][job_b][oper_b], bigM);
+      MPConstraint* const before = solver.MakeRowConstraint((all_job[job_a].operation_list[oper_a].ppid!=
+                                                             all_job[job_b].operation_list[oper_b].ppid)*ppid_cost
+                                                             + all_job[job_a].operation_list[oper_a].process_time[machine_a]
+                                                             - 3*bigM, infinity);
+      before->SetCoefficient( t_j_o[job_a][oper_a], -1.0);
+      before->SetCoefficient( t_j_o[job_b][oper_b], 1.0);
+      before->SetCoefficient( x_j_o_avm[job_a][oper_a][machine_a], -1.0*bigM);
+      before->SetCoefficient( x_j_o_avm[job_b][oper_b][machine_b], -1.0*bigM);
+      before->SetCoefficient( j_o_before_k_l[job_a][oper_a][job_b][oper_b], -1.0*bigM);
+    }
+  }
+}
+  //calculate makespan
+  for(int j=0; j<job_N; j++){
+    MPConstraint* const c_max = solver.MakeRowConstraint(-infinity, 0); // <= 0
+    c_max->SetCoefficient(makespan, -1.0);
+    c_max->SetCoefficient(t_j_o[j][all_job[j].operation_list.size()-1], 1.0);
+    for(int avm=0; avm< all_job[j].operation_list[all_job[j].operation_list.size()-1].ava_machine.size(); avm++){
+      c_max->SetCoefficient(x_j_o_avm[j][all_job[j].operation_list.size()-1][avm], all_job[j].operation_list[all_job[j].operation_list.size()-1].process_time[avm]);
+    }
+  }
+  const MPSolver::ResultStatus result_status = solver.Solve();
+
+  // Check that the problem has an optimal solution.
+  if (result_status != MPSolver::OPTIMAL) {
+    //LOG(FATAL) << "The problem does not have an optimal solution!";
+  }
+  LOG(INFO) << "#variables " << solver.NumVariables() ;
+  LOG(INFO) << "#constraints " << solver.NumConstraints() ;
+  LOG(INFO) << "Problem solved in " << solver.wall_time() << " milliseconds";
+  // The objective value of the solution.
+  LOG(INFO) << "Optimal objective value = " << objective->Value();
+  
+  for(int j=0; j<job_N; j++){
+    for(int op=0; op<all_job[j].operation_list.size(); op++){
+      for(int m=0; m<all_job[j].operation_list[op].ava_machine.size(); m++){
+        if( x_j_o_avm[j][op][m]->solution_value()==1 ){
+          cout<< j<<" "<< all_job[j].operation_list[op].ava_machine[m]<<" "
+          	  <<all_job[j].operation_list[op].ppid<<" "<<t_j_o[j][op]->solution_value()<<" "
+          	  <<all_job[j].operation_list[op].process_time[m]<<endl;
+        }
+      }
+    }
+  }
+  LOG(INFO) << "Advanced usage:";
+  LOG(INFO) << "Problem solved in " << solver.nodes()
+            << " branch-and-bound nodes";
+}
+
+void RunAllExamples() {
+/*#if defined(USE_GLPK)
+  LOG(INFO) << "---- Integer programming example with GLPK ----";
+  RunIntegerProgrammingExample(MPSolver::GLPK_MIXED_INTEGER_PROGRAMMING);
+#endif*/
+#if defined(USE_CBC)
+  LOG(INFO) << "---- Integer programming example with CBC ----";
+  RunIntegerProgrammingExample(MPSolver::CBC_MIXED_INTEGER_PROGRAMMING);
+#endif
+/*#if defined(USE_SCIP)
+  LOG(INFO) << "---- Integer programming example with SCIP ----";
+  RunIntegerProgrammingExample(MPSolver::SCIP_MIXED_INTEGER_PROGRAMMING);
+#endif
+#if defined(USE_GUROBI)
+  LOG(INFO) << "---- Integer programming example with Gurobi ----";
+  RunIntegerProgrammingExample(MPSolver::GUROBI_MIXED_INTEGER_PROGRAMMING);
+#endif  // USE_GUROBI
+#if defined(USE_CPLEX)
+  LOG(INFO) << "---- Integer programming example with CPLEX ----";
+  RunIntegerProgrammingExample(MPSolver::CPLEX_MIXED_INTEGER_PROGRAMMING);
+#endif  // USE_CPLEX*/
+}
+}  // namespace operations_research
+
+int main(int argc, char** argv) {
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  operations_research::RunAllExamples();
+  return 0;
+}
